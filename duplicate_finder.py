@@ -7,7 +7,7 @@ Usage:
     duplicate_finder.py remove <path> ... [--db=<db_path>]
     duplicate_finder.py clear [--db=<db_path>]
     duplicate_finder.py show [--db=<db_path>]
-    duplicate_finder.py find [--print] [--delete] [--match-time] [--trash=<trash_path>] [--db=<db_path>]
+    duplicate_finder.py find [--print] [--delete] [--sort-by-date] [--match-time] [--trash=<trash_path>] [--db=<db_path>]
     duplicate_finder.py -h | --help
 
 Options:
@@ -21,6 +21,9 @@ Options:
     find:
         --print               Only print duplicate files rather than displaying HTML file
         --delete              Move all found duplicate pictures to the trash. This option takes priority over --print.
+        --sort-by-date        Sorts images oldest first (based on capture time). When used with --delete removes more
+                              recent copies. If omitted, image resolution takes precedence and only the highest
+                              resolution image is preserved.
         --match-time          Adds the extra constraint that duplicate images must have the
                               same capture times in order to be considered.
         --trash=<trash_path>  Where files will be put when they are deleted (default: ./Trash)
@@ -128,6 +131,7 @@ def hash_file(file):
 
         file_size = get_file_size(file)
         image_size = get_image_size(img)
+        pixel_count = get_pixel_count(img)
         capture_time = get_capture_time(img)
 
         # 0 degree hash
@@ -148,7 +152,7 @@ def hash_file(file):
         hashes = ''.join(sorted(hashes))
 
         cprint("\tHashed {}".format(file), "blue")
-        return file, hashes, file_size, image_size, capture_time
+        return file, hashes, file_size, image_size, pixel_count, capture_time
     except OSError:
         cprint("\tUnable to open {}".format(file), "red")
         return None
@@ -161,12 +165,13 @@ def hash_files_parallel(files):
                 yield result
 
 
-def _add_to_database(file_, hash_, file_size, image_size, capture_time, db):
+def _add_to_database(file_, hash_, file_size, image_size, pixel_count, capture_time, db):
     try:
         db.insert_one({"_id": file_,
                        "hash": hash_,
                        "file_size": file_size,
                        "image_size": image_size,
+                       "pixel_count": pixel_count,
                        "capture_time": capture_time})
     except pymongo.errors.DuplicateKeyError:
         cprint("Duplicate key: {}".format(file_), "red")
@@ -231,31 +236,49 @@ def same_time(dup):
     return True
 
 
-def find(db, match_time=False):
-    dups = db.aggregate([{
-        "$group": {
-            "_id": "$hash",
-            "total": {"$sum": 1},
-            "items": {
-                "$push": {
-                    "file_name": "$_id",
-                    "file_size": "$file_size",
-                    "image_size": "$image_size",
-                    "capture_time": "$capture_time"
+def find(db, sort_by_date=False, match_time=False):
+    sort = {"file_name": -1, "file_size": -1, "capture_time": -1, "pixel_count": -1}
+    if sort_by_date:
+        sort = {"file_name": -1, "file_size": -1, "pixel_count": -1, "capture_time": -1 }
+
+    dups = db.aggregate(
+        [
+            {
+                "$sort": sort
+            },
+            {
+                "$group": {
+                    "_id": "$hash",
+                    "total": {"$sum": 1},
+                    "items": {
+                        "$push": {
+                            "file_name": "$_id",
+                            "file_size": "$file_size",
+                            "image_size": "$image_size",
+                            "pixel_count": "$pixel_count",
+                            "capture_time": "$capture_time",
+                        }
+                    }
+                }
+            },
+            {
+                "$match": {
+                    "total": {"$gt": 1}
+                }
+            },
+            {
+                "$sort": {
+                    "total": -1
                 }
             }
-        }
-    },
-    {
-        "$match": {
-            "total": {"$gt": 1}
-        }
-    }])
+        ]
+    )
 
     if match_time:
         dups = (d for d in dups if same_time(d))
 
-    return list(dups)
+    dups = list(dups)
+    return dups
 
 
 def delete_duplicates(duplicates, db):
@@ -326,6 +349,8 @@ def get_file_size(file_name):
 def get_image_size(img):
     return "{} x {}".format(*img.size)
 
+def get_pixel_count(img):
+    return img.width * img.height
 
 def get_capture_time(img):
     try:
@@ -362,7 +387,7 @@ if __name__ == '__main__':
         elif args['show']:
             show(db)
         elif args['find']:
-            dups = find(db, args['--match-time'])
+            dups = find(db, args['--sort-by-date'], args['--match-time'])
 
             if args['--delete']:
                 delete_duplicates(dups, db)
